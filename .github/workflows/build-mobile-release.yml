@@ -170,7 +170,9 @@ jobs:
               echo "::warning::未配置 ANDROID_KEY_* secrets，改用本次 CI 临时密钥签名；APK 可安装，但不同批次签名不同"
               ALIAS="hghub-ci"
               SP="hghub-ci-store"
-              KP="hghub-ci-key"
+              # Java 17 默认生成 PKCS12，它不支持 store/key 两个不同密码：
+              # keytool 会忽略 -keypass，但 apksigner 仍用 --key-pass 解私钥 -> BadPaddingException。
+              KP="$SP"
               keytool -genkeypair -keystore "$KS" -alias "$ALIAS" \
                 -keyalg RSA -keysize 2048 -validity 10000 \
                 -storepass "$SP" -keypass "$KP" \
