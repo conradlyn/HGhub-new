@@ -36,7 +36,7 @@ export default function ArticlePage({ plugin, articleId, onBack, openMedia, acti
   useEffect(() => { void request<ArticleDetail>("call", { id: plugin.meta.id, method: "articles.getDetail", args: { id: articleId } }).then(setDetail).catch(e => setError(pluginError(e))); }, []);
   return <BrowseFrame title={detail?.title || "图文详情"} tools={<button onClick={onBack}>返回</button>}><Notice error={error}/>
     {detail && <article className="hpp-article-detail"><p className="hpp-muted">{plugin.meta.name}{detail.author ? ` · ${detail.author.name}` : ""}{detail.publishedAt !== undefined ? ` · ${new Date(detail.publishedAt).toLocaleDateString()}` : ""}</p>
-      {detail.contentHtml !== undefined ? <ArticleHtml plugin={plugin} html={detail.contentHtml}/> : <p className="hpp-article-text">{detail.contentText || detail.summary}</p>}
+      {detail.contentHtml !== undefined ? <ArticleHtml plugin={plugin} html={detail.contentHtml} transform={(detail as ArticleDetail & { bodyImageTransform?: ResourceTransform }).bodyImageTransform}/> : <p className="hpp-article-text">{detail.contentText || detail.summary}</p>}
       {!!detail.streams?.length && (play ? <ContentPlayer plugin={plugin} action="article.prepare" contentId={articleId} active={active}/> : <button onClick={() => setPlay(true)}>播放文内视频</button>)}
       {detail.mediaId && plugin.methods.includes("media.getDetail") && <button onClick={() => openMedia(detail.mediaId!)}>查看关联作品</button>}
       {active && <><MediaInteractions plugin={plugin} detail={detail} kind="article"/><CommentsPanel plugin={plugin} articleId={articleId}/></>}
@@ -72,17 +72,19 @@ export function parseArticleHtml(html: string, insecure: boolean, bodyTransform?
   };
   return { nodes: Array.from(template.content.childNodes).flatMap(n => visit(n, 0)), images };
 }
-function ArticleHtml({ plugin, html }: { plugin: InstalledPlugin; html: string }) {
-  const [bodyTransform, setBodyTransform] = useState<ResourceTransform>();
+function ArticleHtml({ plugin, html, transform }: { plugin: InstalledPlugin; html: string; transform?: ResourceTransform }) {
+  const [fallback, setFallback] = useState<ResourceTransform>();
+  const bodyTransform = transform ?? fallback;
   useEffect(() => {
+    if (transform) return; // 插件已在详情里直接给出，无需再读设置
     void pluginCommand<Record<string, unknown>>("settings.get", { id: plugin.meta.id }).then(settings => {
       try {
         const t = JSON.parse(String(settings.bodyImageTransform || "")) as Partial<ResourceTransform> | null;
         if (t && t.type === "aes-cbc" && typeof t.key === "string" && typeof t.iv === "string" && t.key && t.iv)
-          setBodyTransform({ type: "aes-cbc", key: t.key, iv: t.iv, padding: t.padding === "none" ? "none" : "pkcs7" });
+          setFallback({ type: "aes-cbc", key: t.key, iv: t.iv, padding: t.padding === "none" ? "none" : "pkcs7" });
       } catch { /* 插件未声明正文图片解密设置 */ }
     }).catch(() => {});
-  }, [plugin.meta.id]);
+  }, [plugin.meta.id, transform]);
   const tree = useMemo(() => parseArticleHtml(html, !!plugin.meta.allowInsecureHttp, bodyTransform), [html, plugin.meta.allowInsecureHttp, bodyTransform]);
   const urls = useAssetUrls(plugin.meta.id, tree.images), [error, setError] = useState("");
   const render = (nodes: RichNode[], prefix = ""): ReactNode[] => nodes.map((node, i) => {
