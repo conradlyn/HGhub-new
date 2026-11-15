@@ -3,7 +3,8 @@ name: Build iOS IPA
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    # main 的自动触发已移除：日常推送统一由 build-mobile-release.yml 发布
+    # APK(ABI) + macOS，避免这里重复编译并另外创建一个 Release。
     tags: ["v*"]
 
 jobs:

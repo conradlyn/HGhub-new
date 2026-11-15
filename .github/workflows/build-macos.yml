@@ -2,8 +2,9 @@ name: Build macOS Release
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
+  # 原为 push: branches: ["main"]：每次推送都会跑 3 个 macOS 矩阵并创建
+  # v<版本>-macos Release，与统一的 build-mobile-release.yml 冲突，故改为手动。
+  # 需要单独出 macOS 三架构包时，在 Actions 页手动运行本工作流即可。
 
 jobs:
   macos:
