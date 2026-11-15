@@ -290,7 +290,7 @@ jobs:
       # swatinem/rust-cache 命中时 tauri-build 可能不重跑，导致二进制里嵌的还是旧前端资源。
       # 清掉本 crate 的构建产物，强制重跑 build.rs 重新嵌入 dist。
       - name: 强制重新嵌入前端资源
-        run: cargo clean -p huangguo-client --target-dir src-tauri/target
+        run: cargo clean --manifest-path src-tauri/Cargo.toml -p huangguo-client
 
       - name: 构建 macOS 应用（dmg + app）
         run: pnpm tauri build --config src-tauri/tauri.macos.conf.json --target ${{ steps.ver.outputs.target }}
