@@ -1,6 +1,6 @@
 import { createElement, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ArticleDetail, ArticleItem, Page } from "./protocol";
-import { openPluginLink, pluginError, type InstalledPlugin } from "./client";
+import type { ArticleDetail, ArticleItem, Page, ResourceTransform } from "./protocol";
+import { openPluginLink, pluginCommand, pluginError, type InstalledPlugin } from "./client";
 import { usePluginRequests } from "./usePluginRequests";
 import { BrowseFrame, Notice } from "./BrowsePages";
 import { useAssetUrls } from "./MediaCards";
@@ -52,9 +52,9 @@ function articleUrl(raw: string | null, insecure: boolean) {
   try { const u = new URL(raw); if ((u.protocol === "https:" || insecure && u.protocol === "http:") && !u.username && !u.password) return u.href; } catch { /* Invalid resource stays absent. */ }
 }
 /** Parse in inert template storage. Rebuild every visible node from an allow-list. */
-export function parseArticleHtml(html: string, insecure: boolean) {
+export function parseArticleHtml(html: string, insecure: boolean, bodyTransform?: ResourceTransform) {
   const template = document.createElement("template"); template.innerHTML = html;
-  const images: string[] = [];
+  const images: (string | { url: string; transform: ResourceTransform })[] = [];
   const visit = (node: Node, depth: number): RichNode[] => {
     if (depth > 40) return [];
     if (node.nodeType === Node.TEXT_NODE) return [node.textContent || ""];
@@ -65,7 +65,7 @@ export function parseArticleHtml(html: string, insecure: boolean) {
     if (!allowedTags.has(tag)) return children;
     if (tag === "img") {
       const url = articleUrl(node.getAttribute("src"), insecure); if (!url) return [];
-      const image = images.length; images.push(url);
+      const image = images.length; images.push(bodyTransform ? { url, transform: bodyTransform } : url);
       return [{ tag, children: [], image, alt: (node.getAttribute("alt") || "").slice(0, 200) }];
     }
     return [{ tag, children, ...(tag === "a" ? { href: articleUrl(node.getAttribute("href"), insecure) } : {}) }];
@@ -73,7 +73,17 @@ export function parseArticleHtml(html: string, insecure: boolean) {
   return { nodes: Array.from(template.content.childNodes).flatMap(n => visit(n, 0)), images };
 }
 function ArticleHtml({ plugin, html }: { plugin: InstalledPlugin; html: string }) {
-  const tree = useMemo(() => parseArticleHtml(html, !!plugin.meta.allowInsecureHttp), [html, plugin.meta.allowInsecureHttp]);
+  const [bodyTransform, setBodyTransform] = useState<ResourceTransform>();
+  useEffect(() => {
+    void pluginCommand<Record<string, unknown>>("settings.get", { id: plugin.meta.id }).then(settings => {
+      try {
+        const t = JSON.parse(String(settings.bodyImageTransform || "")) as Partial<ResourceTransform> | null;
+        if (t && t.type === "aes-cbc" && typeof t.key === "string" && typeof t.iv === "string" && t.key && t.iv)
+          setBodyTransform({ type: "aes-cbc", key: t.key, iv: t.iv, padding: t.padding === "none" ? "none" : "pkcs7" });
+      } catch { /* 插件未声明正文图片解密设置 */ }
+    }).catch(() => {});
+  }, [plugin.meta.id]);
+  const tree = useMemo(() => parseArticleHtml(html, !!plugin.meta.allowInsecureHttp, bodyTransform), [html, plugin.meta.allowInsecureHttp, bodyTransform]);
   const urls = useAssetUrls(plugin.meta.id, tree.images), [error, setError] = useState("");
   const render = (nodes: RichNode[], prefix = ""): ReactNode[] => nodes.map((node, i) => {
     const key = `${prefix}/${i}`;
