@@ -277,8 +277,37 @@ jobs:
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
 
+      # 显式重建前端：不依赖 beforeBuildCommand，并把产物哈希记录下来供后面自检。
+      - name: 构建前端（dist）
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm build
+          JS="$(ls dist/assets/index-*.js | head -1)"
+          echo "dist JS: $(basename "$JS")"
+          echo "DIST_JS=$(basename "$JS")" >> "$GITHUB_ENV"
+
+      # swatinem/rust-cache 命中时 tauri-build 可能不重跑，导致二进制里嵌的还是旧前端资源。
+      # 清掉本 crate 的构建产物，强制重跑 build.rs 重新嵌入 dist。
+      - name: 强制重新嵌入前端资源
+        run: cargo clean -p huangguo-client --target-dir src-tauri/target
+
       - name: 构建 macOS 应用（dmg + app）
         run: pnpm tauri build --config src-tauri/tauri.macos.conf.json --target ${{ steps.ver.outputs.target }}
+
+      # 自检：二进制里嵌入的 JS 必须与刚构建的 dist 一致，否则直接失败而不是发出旧包。
+      - name: 校验前端资源已嵌入最新构建
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$(find src-tauri/target -type f -name 'huangguo-client' -path '*release*' | head -1)"
+          if [ -z "$BIN" ]; then echo "::error::未找到可执行文件"; exit 1; fi
+          APP_JS="$(strings -a "$BIN" | grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' | head -1 | xargs -n1 basename)"
+          echo "二进制 JS: $APP_JS / dist JS: $DIST_JS"
+          if [ "$APP_JS" != "$DIST_JS" ]; then
+            echo "::error::前端资源未更新（二进制=$APP_JS dist=$DIST_JS）"
+            exit 1
+          fi
 
       - name: 整理产物
         shell: bash
