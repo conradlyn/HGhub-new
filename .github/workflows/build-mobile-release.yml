@@ -148,53 +148,82 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          set -euo pipefail
-          KS="$RUNNER_TEMP/hghub-release.keystore"
-          SUFFIX=""
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            echo "使用仓库固定发布密钥签名"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
-            ALIAS="${KEY_ALIAS:-hghub}"
-            SP="$STORE_PASSWORD"
-            KP="$KEY_PASSWORD"
-          else
-            echo "::warning::未配置 ANDROID_KEY_* secrets，改用本次 CI 临时密钥签名；APK 可安装，但不同批次签名不同"
-            ALIAS="hghub-ci"
-            SP="hghub-ci-store"
-            KP="hghub-ci-key"
-            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$SP" -keypass "$KP" \
-              -dname "CN=HGhub CI, OU=CI, O=HGhub, L=Shanghai, ST=Shanghai, C=CN" > /dev/null 2>&1
-            SUFFIX="_ci-signed"
-          fi
+          set +e
+          {
+            set -euo pipefail
+            SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+            echo "Android SDK = $SDK"
+            echo "=== build-tools ==="
+            ls -1 "$SDK/build-tools"
+            echo "=== APK 产物树 ==="
+            find src-tauri/gen/android -type f -name '*.apk' | sort
 
-          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
-          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
-          mkdir -p artifacts
-          found=0
-          for f in $(find src-tauri/gen/android/app/build/outputs/apk -type f -iname '*release*.apk' | sort); do
-            raw="$(basename "$(dirname "$(dirname "$f")")")"
-            case "$raw" in
-              arm64)   abi="arm64-v8a" ;;
-              arm)     abi="armeabi-v7a" ;;
-              x86_64)  abi="x86_64" ;;
-              x86)     abi="x86" ;;
-              *)       abi="$raw" ;;
-            esac
-            out="artifacts/HGhub_${VERSION}_android_${abi}${SUFFIX}.apk"
-            echo "签名 $f -> $out (ABI=$abi)"
-            "$APKSIGNER" sign --ks "$KS" --ks-key-alias "$ALIAS" \
-              --ks-pass "pass:$SP" --key-pass "pass:$KP" \
-              --v4-signing-enabled false --out "$out" "$f"
-            "$APKSIGNER" verify --print-certs "$out" | head -3
-            found=$((found + 1))
-          done
-          rm -f "$KS"
-          if [ "$found" -eq 0 ]; then
-            echo "::error::没有找到 release APK"; exit 1
+            KS="$RUNNER_TEMP/hghub-release.keystore"
+            SUFFIX=""
+            if [ -n "${KEYSTORE_BASE64:-}" ]; then
+              echo "使用仓库固定发布密钥签名"
+              echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+              ALIAS="${KEY_ALIAS:-hghub}"
+              SP="$STORE_PASSWORD"
+              KP="$KEY_PASSWORD"
+            else
+              echo "::warning::未配置 ANDROID_KEY_* secrets，改用本次 CI 临时密钥签名；APK 可安装，但不同批次签名不同"
+              ALIAS="hghub-ci"
+              SP="hghub-ci-store"
+              KP="hghub-ci-key"
+              keytool -genkeypair -keystore "$KS" -alias "$ALIAS" \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "$SP" -keypass "$KP" \
+                -dname "CN=HGhub CI, OU=CI, O=HGhub, L=Shanghai, ST=Shanghai, C=CN"
+              SUFFIX="_ci-signed"
+            fi
+
+            BT_DIR="$(find "$SDK/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+            APKSIGNER="$BT_DIR/apksigner"
+            test -x "$APKSIGNER" || { echo "apksigner 不可执行: $APKSIGNER"; exit 1; }
+            echo "apksigner = $APKSIGNER"
+
+            mkdir -p artifacts
+            mapfile -t APK_FILES < <(find src-tauri/gen/android -type f -name '*.apk' | sort)
+            found=0
+            for f in "${APK_FILES[@]}"; do
+              case "$f" in *debug*) continue ;; esac
+              raw=""
+              for seg in $(printf '%s' "$f" | tr '/' ' '); do
+                case "$seg" in
+                  arm64|arm|x86_64|x86|arm64-v8a|armeabi-v7a|universal) raw="$seg"; break ;;
+                esac
+              done
+              [ -n "$raw" ] || raw="$(basename "$(dirname "$f")")"
+              case "$raw" in
+                arm64|arm64-v8a) abi="arm64-v8a" ;;
+                arm|armeabi-v7a) abi="armeabi-v7a" ;;
+                x86_64)          abi="x86_64" ;;
+                x86)             abi="x86" ;;
+                *)               abi="$raw" ;;
+              esac
+              out="artifacts/HGhub_${VERSION}_android_${abi}${SUFFIX}.apk"
+              echo "签名 $f -> $out (ABI=$abi)"
+              "$APKSIGNER" sign --ks "$KS" --ks-key-alias "$ALIAS" \
+                --ks-pass "pass:$SP" --key-pass "pass:$KP" \
+                --v4-signing-enabled false --out "$out" "$f"
+              # 不要直接 | head：pipefail 下 head 提前关闭管道会误判为失败。
+              "$APKSIGNER" verify --print-certs "$out" > /tmp/apksigner-verify.txt 2>&1 || {
+                cat /tmp/apksigner-verify.txt; exit 1; }
+              head -3 /tmp/apksigner-verify.txt
+              found=$((found + 1))
+            done
+            rm -f "$KS"
+            if [ "$found" -eq 0 ]; then
+              echo "没有找到可签名的 release APK"; exit 1
+            fi
+            ls -lh artifacts
+          } 2>&1 | tee /tmp/sign.log
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -ne 0 ]; then
+            python3 -c "t=open('/tmp/sign.log',errors='replace').read().splitlines(); s='\n'.join(t[-45:])[-6000:]; print('::error title=APK 签名失败::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+            exit "$RC"
           fi
-          ls -lh artifacts
 
       - uses: actions/upload-artifact@v4
         with:
