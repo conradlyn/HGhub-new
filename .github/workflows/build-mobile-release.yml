@@ -21,6 +21,8 @@ on:
           - universal
   push:
     tags: ["mobile-v*"]
+    # 仅用于失败后重跑：不新建 tag，产物会补进已有的 mobile-v<版本> Release
+    branches: ["ci-rerun"]
 
 concurrency:
   group: mobile-release-${{ github.ref }}
@@ -80,6 +82,15 @@ jobs:
           echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
           ls -1 "$SDK/ndk"
 
+      # hpp crate 在 Android target 上让 rquickjs 走 bindgen，生成绑定需要 libclang
+      - name: 安装 clang / libclang（bindgen 依赖）
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)" >> "$GITHUB_ENV"
+          clang --version | head -1
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
@@ -95,7 +106,16 @@ jobs:
         run: pnpm tauri android init --ci
 
       - name: 构建 APK（按 ABI 拆分）
-        run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7
+        shell: bash
+        run: |
+          set +e
+          pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 2>&1 | tee /tmp/android-build.log
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -ne 0 ]; then
+            python3 -c "import re; t=open('/tmp/android-build.log',errors='replace').read().splitlines(); l=[x for x in t if re.search(r'error|failed|panic|not found|cannot|ERROR|FAILED|undefined',x)]; s='\n'.join((l[-40:] if l else t[-40:]))[-6000:]; print('::error title=Android build failed::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+            echo "::error::完整日志已打印在上方步骤输出中（截取最后 40 条关键行）"
+            exit "$RC"
+          fi
 
       - name: 签名并整理 APK
         shell: bash
