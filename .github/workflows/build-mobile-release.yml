@@ -79,7 +79,11 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
           "$SDKM" --install "platform-tools" "platforms;android-36" \
             "build-tools;36.0.0" "ndk;28.2.13676358"
-          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          # build.rs 优先读 NDK_HOME，Tauri 读 ANDROID_NDK_HOME；两者必须指向同一个 NDK，
+          # 否则 bindgen 的 --sysroot 与实际编译用的 sysroot 会错配。
+          NDK="$SDK/ndk/28.2.13676358"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           ls -1 "$SDK/ndk"
 
       # hpp crate 在 Android target 上让 rquickjs 走 bindgen，生成绑定需要 libclang
@@ -90,6 +94,24 @@ jobs:
           sudo apt-get install -y -qq clang libclang-dev llvm-dev
           echo "LIBCLANG_PATH=$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)" >> "$GITHUB_ENV"
           clang --version | head -1
+
+      # NDK 27+ 的 sysroot/usr/include/sys/cdefs.h 拒绝不带 API level 的 target triple：
+      #   "Unversioned target triples are not supported!"
+      # vendor/rquickjs-sys/build.rs 的 Android 分支只传了 --sysroot 和 -resource-dir，
+      # bindgen 会沿用 cargo 的裸 triple（aarch64-linux-android），于是在生成绑定时 panic。
+      # 这里补上 __ANDROID_API__ 和带版本号的 --target；上游没有 Android CI，只能在 fork 修。
+      - name: 为 bindgen 指定带 API level 的 Android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          API=24
+          COMMON="-D__ANDROID_API__=$API"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=$COMMON" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android$API $COMMON" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_armv7_linux_androideabi=--target=armv7a-linux-androideabi$API $COMMON" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${NDK_HOME:-unset}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-unset}"
+          echo "bindgen Android API level = $API"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
