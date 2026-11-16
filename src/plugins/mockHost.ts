@@ -62,7 +62,7 @@ export function createMockHost(options: MockHostOptions = {}) {
       base64Decode: text => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)),
     },
     crypto: options.crypto || {
-      digest: () => unsupported("crypto.digest"), hmac: () => unsupported("crypto.hmac"), aesEncrypt: () => unsupported("crypto.aesEncrypt"), aesDecrypt: () => unsupported("crypto.aesDecrypt"),
+      digest: () => unsupported("crypto.digest"), hmac: () => unsupported("crypto.hmac"), aesEncrypt: () => unsupported("crypto.aesEncrypt"), aesDecrypt: () => unsupported("crypto.aesDecrypt"), rsaEncrypt: () => unsupported("crypto.rsaEncrypt"),
       randomUUID: () => crypto.randomUUID(), randomBytes: length => crypto.getRandomValues(new Uint8Array(length)),
     },
     html: options.html || { parse: () => unsupported("html.parse") },

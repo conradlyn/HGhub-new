@@ -19,7 +19,7 @@
 | 网络 | hg.http | 非 2xx 返回响应，插件映射业务错误 |
 | 持久化 | hg.storage | 5 MiB/插件，256 KiB/值，支持 TTL |
 | Cookie | hg.cookies | 每插件独立罐，不能共享其他源账号 |
-| 摘要/对称加密 | hg.crypto | HMAC、AES、随机数；RSA 尚缺 |
+| 摘要/加密 | hg.crypto | HMAC、AES、RSA 公钥加密、随机数；RSA 支持范围见下文 |
 | 编解码 | hg.codec | UTF-8、Base64、Hex、legacy charset |
 | HTML | hg.html | 节点仅当前调用内使用，不可作为业务返回值 |
 | 设置 | hg.settings | 保存后宿主重建插件 |
@@ -30,6 +30,22 @@
 每个插件使用独立 QuickJS，调用可以在 await 之间交错。不要把当前请求参数或信号放在共享闭包变量中；需持久状态使用存储。
 
 业务数据允许普通对象、数组、有限数字、字符串、布尔、null、Uint8Array。对象 undefined 属性丢弃；数组不能有 undefined/空位。不得返回 Date、Map、类实例、函数或环。总值最多 8 MiB、深度 32 层。
+
+## RSA 公钥加密
+
+`hg.crypto.rsaEncrypt` 是同步必需 API，接受 1024–8192 位 SPKI（`PUBLIC KEY`）或 PKCS#1（`RSA PUBLIC KEY`）PEM。必须指定 `pkcs1`、`oaep-sha1` 或 `oaep-sha256`，输入和输出都是 `Uint8Array`；文本先用 `hg.codec.utf8Encode`。
+
+```js
+const ciphertext = hg.crypto.rsaEncrypt(
+  { publicKey: publicKeyPem, padding: "oaep-sha256" },
+  hg.codec.utf8Encode(password),
+);
+const encoded = hg.codec.base64Encode(ciphertext);
+```
+
+填充方式由上游接口决定。OAEP 的 MGF1 使用同一摘要，label 为空；随机填充由操作系统随机源提供，相同明文的密文通常不同。单次只加密一个 RSA 块，不自动分块：2048 位密钥的上限分别为 245、214、190 字节，按 UTF-8 编码后的字节数计算。格式、类型、密钥范围或明文长度不合法时抛 `INVALID_ARGUMENT`，不提供私钥解密 API。
+
+依赖该方法且无法降级的插件应声明 `meta.requires: [{ type: "api", name: "crypto.rsaEncrypt" }]`；旧开发版会在启用前标记不兼容。内存假宿主须注入加密适配器，算法正确性使用真实 Rust/QuickJS 宿主验证。
 
 ## 播放
 

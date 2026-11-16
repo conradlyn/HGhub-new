@@ -219,6 +219,7 @@ impl PluginManager {
                     "crypto.hmac",
                     "crypto.aesEncrypt",
                     "crypto.aesDecrypt",
+                    "crypto.rsaEncrypt",
                     "crypto.randomBytes",
                     "crypto.randomUUID",
                     "codec.base64Encode",

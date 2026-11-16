@@ -253,7 +253,13 @@ interface RsaParams {
 ```
 
 - GCM 的 16 字节认证标签附在密文末尾；校验失败抛 `INVALID_ARGUMENT`。
-- `rsaEncrypt` 只做公钥加密（部分上游要求用公钥加密登录密码）。
+- `rsaEncrypt` 只做公钥加密（部分上游要求用公钥加密登录密码）。公钥模数为 1024–8192 位；
+  PEM 标签为 `PUBLIC KEY`（SPKI）或 `RSA PUBLIC KEY`（PKCS#1），不接受私钥。
+- RSA 的 `pkcs1` 表示 RSAES-PKCS1-v1_5；OAEP 使用所选摘要及相同摘要的 MGF1，label 为空。
+  由系统安全随机源提供填充随机性，返回长度为模数字节数的密文，不自动分块。
+- 设模数字节数为 k，RSA 单次明文上限：`pkcs1` 为 k−11，`oaep-sha1` 为 k−42，
+  `oaep-sha256` 为 k−66。`data` 必须是 `Uint8Array`；文本先 UTF-8 编码，再按字节计算长度。
+  无效 PEM/公钥、填充、类型或超长明文抛 `INVALID_ARGUMENT`；随机源失败抛 `INTERNAL`。
 - 上表之外的算法由插件自行打包纯 JS 实现。
 
 ## 8. `hg.codec`
