@@ -3,6 +3,7 @@ use crate::{
     native::{Logs, Native},
     network::Network,
     store::{now, Store},
+    web_login::{LoginCompletion, LoginRequest, WebLoginProvider},
     wire::Transfer,
     PluginError, Result,
 };
@@ -194,7 +195,14 @@ impl Engine {
             .map_err(|e| self.error(e))
             .and_then(Meta::parse)
     }
-    fn install(&self, meta: &Meta, settings: &Value, endpoint: &Value) -> Result<Vec<String>> {
+    fn install(
+        &self,
+        meta: &Meta,
+        settings: &Value,
+        endpoint: &Value,
+        media: &crate::capabilities::MediaCapabilities,
+        web_login: bool,
+    ) -> Result<Vec<String>> {
         *self.slice.borrow_mut() = Instant::now();
         self.context
             .with(|ctx| -> rquickjs::Result<String> {
@@ -208,7 +216,8 @@ impl Engine {
                     .restore(&ctx)?;
                 let p: rquickjs::Promise = install.call((
                     factory,
-                    json!({"meta":meta,"settings":settings,"endpoint":endpoint}).to_string(),
+                    json!({"meta":meta,"settings":settings,"endpoint":endpoint,"media":media,"webLogin":web_login})
+                        .to_string(),
                 ))?;
                 p.finish()
             })
@@ -279,9 +288,15 @@ struct Call {
     method: String,
     params: Transfer,
     deadline: Instant,
+    user_auth: bool,
+    web_wait: Option<Instant>,
     cancel: CancellationToken,
     reply: oneshot::Sender<Result<Transfer>>,
     _permit: OwnedSemaphorePermit,
+}
+enum HostReply {
+    Operation(Result<Transfer>),
+    Login(Arc<LoginRequest>, Result<LoginCompletion>),
 }
 enum Command {
     Call(Call),
@@ -294,6 +309,7 @@ pub struct Worker {
     slots: Arc<Semaphore>,
     fault: Arc<Mutex<Option<PluginError>>>,
     pub methods: Vec<String>,
+    pub media: crate::capabilities::MediaCapabilities,
 }
 impl Worker {
     pub async fn spawn(
@@ -304,6 +320,8 @@ impl Worker {
         store: Arc<Store>,
         network: Arc<Network>,
         logs: Logs,
+        media: crate::capabilities::MediaCapabilities,
+        web_login: Option<Arc<dyn WebLoginProvider>>,
     ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<Command>(40);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -314,6 +332,7 @@ impl Worker {
         let fault = Arc::new(Mutex::new(None));
         let thread_fault = fault.clone();
         let thread_name = format!("hpp:{}", meta.id);
+        let thread_media = media.clone();
         let run_worker = move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -329,7 +348,13 @@ impl Worker {
                 let make = || {
                     let e = Engine::new(logs.clone(), token_map.clone(), stop.clone())?;
                     e.inspect(&source)?;
-                    let methods = e.install(&meta, &settings, &endpoint)?;
+                    let methods = e.install(
+                        &meta,
+                        &settings,
+                        &endpoint,
+                        &thread_media,
+                        web_login.is_some(),
+                    )?;
                     Ok::<_, PluginError>((e, methods))
                 };
                 let (mut engine, methods) = match make() {
@@ -343,8 +368,7 @@ impl Worker {
                 let mut calls: HashMap<String, Call> = HashMap::new();
                 let mut queue: VecDeque<Call> = VecDeque::new();
                 let mut tasks: HashMap<String, (String, CancellationToken)> = HashMap::new();
-                let (done_tx, mut done_rx) =
-                    mpsc::unbounded_channel::<(u64, String, Result<Transfer>)>();
+                let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, String, HostReply)>();
                 let mut generation = 0u64;
                 let mut failures = 0;
                 let mut idle = Instant::now();
@@ -353,7 +377,27 @@ impl Worker {
                     tokio::select! {
                         command=receiver.recv()=>match command{Some(Command::Call(c))=>{queue.push_back(c);idle=Instant::now();},None=>break},
                         Some((epoch,id,result))=done_rx.recv()=>{
-                            if epoch==generation {if let Some((owner,_))=tasks.remove(&id){if calls.contains_key(&owner){let _=engine.invoke("deliver",(id,response(result)));}}}
+                            if epoch == generation {
+                                if let Some((owner, token)) = tasks.remove(&id) {
+                                    if let Some(call) = calls.get_mut(&owner) {
+                                        if !token.is_cancelled() && !stop.load(Ordering::Relaxed) {
+                                            let result = match result {
+                                                HostReply::Operation(result) => result,
+                                                HostReply::Login(request, result) => {
+                                                    if let Some(started) = call.web_wait.take() {
+                                                        call.deadline += started.elapsed();
+                                                        let unix = now() + call.deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+                                                        let _ = engine.invoke("setDeadline", (owner, unix));
+                                                    }
+                                                    result.and_then(|result| request.commit(result, &network))
+                                                        .map(|url| Transfer::from_json(json!({"finalUrl":url})))
+                                                }
+                                            };
+                                            let _ = engine.invoke("deliver", (id, response(result)));
+                                        }
+                                    }
+                                }
+                            }
                         },
                         _=ticker.tick()=>{}
                     }
@@ -362,7 +406,10 @@ impl Worker {
                     }
                     let expired = calls
                         .iter()
-                        .filter(|(_, c)| c.cancel.is_cancelled() || Instant::now() >= c.deadline)
+                        .filter(|(_, c)| {
+                            c.cancel.is_cancelled()
+                                || c.web_wait.is_none() && Instant::now() >= c.deadline
+                        })
                         .map(|(id, _)| id.clone())
                         .collect::<Vec<_>>();
                     for id in expired {
@@ -494,6 +541,65 @@ impl Worker {
                             }
                             continue;
                         }
+                        if msg["op"] == "webview.open" {
+                            let open = (|| {
+                                let provider = web_login
+                                    .clone()
+                                    .filter(|_| {
+                                        calls.get(&scope).is_some_and(|c| {
+                                            c.user_auth && !c.cancel.is_cancelled()
+                                        })
+                                    })
+                                    .ok_or_else(|| {
+                                        PluginError::new("UNSUPPORTED", "请从账号登录按钮打开网页")
+                                    })?;
+                                if calls.values().any(|c| c.web_wait.is_some()) {
+                                    return Err(PluginError::new(
+                                        "RATE_LIMITED",
+                                        "该插件已有登录窗口",
+                                    ));
+                                }
+                                let params: Transfer =
+                                    serde_json::from_value(msg["params"].clone())
+                                        .map_err(|_| PluginError::invalid("无效网页登录参数"))?;
+                                params.validate(8 * 1024 * 1024)?;
+                                Ok((
+                                    provider,
+                                    Arc::new(LoginRequest::parse(params.json(), &network)?),
+                                ))
+                            })();
+                            match open {
+                                Err(error) => {
+                                    let _ = engine.invoke("deliver", (id, response(Err(error))));
+                                }
+                                Ok((provider, request)) => {
+                                    let call = calls.get_mut(&scope).unwrap();
+                                    call.web_wait = Some(Instant::now());
+                                    let _ = engine
+                                        .invoke("setDeadline", (scope.clone(), rquickjs::Null));
+                                    let cancel = call.cancel.child_token();
+                                    tasks.insert(id.clone(), (scope, cancel.clone()));
+                                    let (done, epoch, plugin) =
+                                        (done_tx.clone(), generation, meta.id.clone());
+                                    tokio::spawn(async move {
+                                        let close = cancel.child_token();
+                                        let future =
+                                            provider.open(plugin, request.clone(), close.clone());
+                                        let result = tokio::select! {biased;
+                                            _ = cancel.cancelled() => Err(PluginError::cancelled()),
+                                            v = tokio::time::timeout(Duration::from_secs(request.timeout_sec), future) => v.unwrap_or_else(|_| Err(PluginError::timeout()))
+                                        };
+                                        close.cancel();
+                                        let _ = done.send((
+                                            epoch,
+                                            id,
+                                            HostReply::Login(request, result),
+                                        ));
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         let Some(c) = calls.get(&scope) else {
                             continue;
                         };
@@ -526,7 +632,7 @@ impl Worker {
                                 }
                             };
                             let result = tokio::select! {biased; _=cancel.cancelled()=>Err(PluginError::cancelled()),r=result=>r};
-                            let _ = done.send((epoch, id, result));
+                            let _ = done.send((epoch, id, HostReply::Operation(result)));
                         });
                     }
                     tasks.retain(|_, (_, t)| !t.is_cancelled());
@@ -564,6 +670,7 @@ impl Worker {
             shutdown,
             slots: Arc::new(Semaphore::new(40)),
             methods,
+            media,
             fault,
         })
     }
@@ -597,6 +704,16 @@ impl Worker {
         params: Transfer,
         budget: Duration,
     ) -> Result<Transfer> {
+        self.call_scoped(id, method, params, budget, false).await
+    }
+    pub async fn call_scoped(
+        &self,
+        id: String,
+        method: String,
+        params: Transfer,
+        budget: Duration,
+        user_auth: bool,
+    ) -> Result<Transfer> {
         params.validate(8 * 1024 * 1024)?;
         let permit = self
             .slots
@@ -627,6 +744,8 @@ impl Worker {
                 method,
                 params,
                 deadline: Instant::now() + budget,
+                user_auth,
+                web_wait: None,
                 cancel,
                 reply,
                 _permit: permit,

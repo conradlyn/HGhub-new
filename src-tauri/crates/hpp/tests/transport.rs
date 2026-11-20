@@ -38,6 +38,7 @@ async fn fixture(
             }else{out=out.header("content-length",bytes.len());bytes.into()}
         },
         "/image"=>"fixture-image".into(),
+        "/subtitle"=>{out=out.header("content-type","application/octet-stream");"1\r\n00:00:01,000 --> 00:00:02,500\r\n字幕\r\n".into()},
         _=>"fixture-resource".into()
     };
     out.body(if method == Method::HEAD {
@@ -64,6 +65,89 @@ fn manager(dir: &tempfile::TempDir) -> Arc<PluginManager> {
 }
 fn params() -> Value {
     json!({"mediaId":"one","episodeId":"ep1","playlistId":"main","reason":"play","codecs":["h264"]})
+}
+
+#[tokio::test]
+async fn srt_tracks_use_declared_format_and_isolate_failures() {
+    let (base, seen, task) = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let m = manager(&dir);
+    let playback = json!({"streams":[{"url":format!("{base}/movie.mp4"),"format":"progressive"}],
+        "subtitles":[
+            {"url":format!("{base}/subtitle"),"format":"srt","language":"zh","label":"中文","default":true},
+            {"url":format!("{base}/subtitle"),"format":"vtt","language":"en","label":"Original"},
+            {"url":format!("{base}/bad"),"format":"srt","label":"坏字幕"}]});
+    let source = SOURCE.replace(
+        "{streams:[{url:\"https://media.example/movie.mp4\",format:\"progressive\"}]}",
+        &playback.to_string(),
+    );
+    m.import_code(source, None, false).await.unwrap();
+    let media = m
+        .prepare_media("fixture.source", params(), 0, None, "subtitle".into())
+        .await
+        .unwrap();
+    let tracks = media.playback["subtitles"].as_array().unwrap();
+    assert_eq!(tracks.len(), 3);
+    assert_eq!(tracks[0]["format"], "vtt");
+    assert_eq!(tracks[0]["language"], "zh");
+    assert_eq!(tracks[0]["label"], "中文");
+    assert_eq!(tracks[0]["default"], true);
+    assert_ne!(tracks[0]["url"], tracks[1]["url"]);
+    let client = reqwest::Client::new();
+    let url = tracks[0]["url"].as_str().unwrap();
+    let response = client.get(url).send().await.unwrap();
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/vtt; charset=utf-8"
+    );
+    let converted = response.bytes().await.unwrap();
+    assert_eq!(
+        &converted[..],
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\n字幕\n\n".as_bytes()
+    );
+    let head = client.head(url).send().await.unwrap();
+    assert_eq!(
+        head.headers()["content-length"],
+        converted.len().to_string()
+    );
+    assert!(head.bytes().await.unwrap().is_empty());
+    let range = client
+        .get(url)
+        .header("range", "bytes=0-5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(range.status(), 206);
+    assert_eq!(range.text().await.unwrap(), "WEBVTT");
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path == "/subtitle")
+        .all(|(_, headers)| !headers.contains_key("range")));
+    assert_eq!(
+        client
+            .get(tracks[2]["url"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        502
+    );
+    assert_eq!(
+        client
+            .get(&media.url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "0123456789"
+    );
+    m.sessions.release(&media.session_id);
+    assert_eq!(client.get(url).send().await.unwrap().status(), 404);
+    task.abort();
 }
 fn http_source(base: &str) -> String {
     SOURCE.replace("if(query===\"spin\")",&format!(r#"

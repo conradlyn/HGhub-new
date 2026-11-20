@@ -32,6 +32,7 @@ static MEDIA_TRANSFERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
 static IMAGE_TRANSFERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 mod preload;
+mod subtitles;
 #[derive(Default)]
 pub struct MediaSessions {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -53,6 +54,7 @@ struct Resource {
     url: String,
     headers: Value,
     kind: String,
+    subtitle_format: Option<String>,
     transforms: Value,
     credential_origin: String,
 }
@@ -241,6 +243,7 @@ fn resource(provider: &str, stream: &Value, headers: Value, kind: &str) -> Resul
         url,
         headers,
         kind: kind.into(),
+        subtitle_format: (kind == "subtitle").then(|| stream["format"].as_str().unwrap().into()),
         transforms: stream["transforms"].clone(),
     })
 }
@@ -560,7 +563,8 @@ impl PluginManager {
             playback["streams"] = resolved["streams"].clone();
         }
         if selected["kind"] == "external" {
-            let mut e = PluginError::new("UNSUPPORTED", "该流需要外部播放器");
+            choices["external"] = json!({"url":selected["url"],"app":selected["external"]["app"],"mime":selected["external"]["mime"],"expiresAt":playback["expiresAt"]});
+            let mut e = PluginError::new("INTERACTION_REQUIRED", "该流需要在外部应用中打开");
             e.playback_choices = Some(choices);
             return Err(e);
         }
@@ -596,7 +600,20 @@ impl PluginManager {
         )?)?;
         let id = uuid::Uuid::new_v4().to_string();
         let mut subtitles = vec![];
-        for (owner, mut track) in subtitle_providers {
+        let default_track = subtitle_providers
+            .iter()
+            .position(|(owner, track)| {
+                owner == &provider && track["format"] != "ass" && track["default"] == true
+            })
+            .or_else(|| {
+                subtitle_providers
+                    .iter()
+                    .position(|(_, track)| track["format"] != "ass" && track["default"] == true)
+            });
+        for (track_index, (owner, mut track)) in subtitle_providers.into_iter().enumerate() {
+            if track["format"] == "ass" {
+                continue;
+            }
             let index = session.register(resource(
                 &owner,
                 &track,
@@ -604,6 +621,12 @@ impl PluginManager {
                 "subtitle",
             )?)?;
             track["url"] = json!(format!("{base}/hpp/{id}/{index}"));
+            if track["format"] == "srt" {
+                track["format"] = json!("vtt");
+            }
+            if track.get("default").is_some() {
+                track["default"] = json!(default_track == Some(track_index));
+            }
             if let Some(o) = track.as_object_mut() {
                 o.remove("headers");
             }
@@ -745,7 +768,8 @@ async fn proxy_upstream(
 ) -> Result<Response<Body>> {
     let network = &session.providers[&r.provider].0;
     let transform = r.transforms.get(&r.kind).filter(|v| !v.is_null());
-    let buffered = r.kind == "playlist" || transform.is_some();
+    let buffered =
+        r.kind == "playlist" || r.subtitle_format.as_deref() == Some("srt") || transform.is_some();
     let mut headers = network::headers(&r.headers)?;
     if origin(&r.url)? != r.credential_origin {
         headers.remove("authorization");
@@ -898,6 +922,10 @@ async fn proxy_upstream(
         })?
         .into_bytes();
         content_type = "application/vnd.apple.mpegurl".into();
+    }
+    if r.subtitle_format.as_deref() == Some("srt") {
+        data = subtitles::srt_to_vtt(&data, &content_type)?;
+        content_type = "text/vtt; charset=utf-8".into();
     }
     bounded_response(data, &content_type, method, &incoming)
 }

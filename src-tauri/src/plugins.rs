@@ -41,11 +41,48 @@ pub async fn pick_plugin_files(app: tauri::AppHandle) -> Result<Vec<String>> {
     .map_err(|_| hghub_hpp::PluginError::internal("无法打开文件选择器"))?
 }
 
+pub struct PluginHost {
+    dir: std::path::PathBuf,
+    ready: tokio::sync::OnceCell<Arc<PluginManager>>,
+}
+impl PluginHost {
+    pub fn new(dir: std::path::PathBuf) -> Self {
+        Self {
+            dir,
+            ready: Default::default(),
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn hpp_manage(
-    manager: tauri::State<'_, Arc<PluginManager>>,
+    app: tauri::AppHandle,
+    host: tauri::State<'_, PluginHost>,
     action: String,
     params: Value,
 ) -> Result<Value> {
-    hghub_hpp::ipc::dispatch(manager.inner(), action, params).await
+    let manager = host
+        .ready
+        .get_or_try_init(|| async {
+            let manager = PluginManager::open(host.dir.clone())?
+                .with_document_reader(Arc::new(PickedDocuments(app.clone())));
+            #[cfg(target_os = "windows")]
+            let manager = match crate::windows_login::WindowsLogin::detect() {
+                Some(provider) => manager.with_web_login(Arc::new(provider)),
+                None => manager,
+            };
+            #[cfg(target_os = "android")]
+            let manager = {
+                use tauri::Manager;
+                let provider = app.state::<crate::android_login::AndroidLogin>();
+                if provider.supported().await? {
+                    manager.with_web_login(Arc::new(provider.inner().clone()))
+                } else {
+                    manager
+                }
+            };
+            Ok::<_, hghub_hpp::PluginError>(Arc::new(manager))
+        })
+        .await?;
+    hghub_hpp::ipc::dispatch(manager, action, params).await
 }

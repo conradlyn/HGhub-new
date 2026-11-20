@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Hls from "hls.js";
 import workerPath from 'hls.js/dist/hls.worker.js?url';
+import { hlsPlaybackPath } from '../plugins/mediaCapabilities';
 import { playbackTiming } from '../plugins/playbackTiming';
 import { pluginCommand, type PreparedMedia } from "../plugins/client";
 
@@ -60,7 +61,7 @@ export default forwardRef<VideoHandle, Props>(function VideoSurface(props, forwa
     const visibility=()=>{if(document.hidden){resume=!v.paused;v.pause();hls.current?.stopLoad();}else if(resume){resume=false;if(latest.current.active){hls.current?.startLoad(v.currentTime);play();}}};
     v.muted=p.muted;v.volume=p.volume;v.playbackRate=p.rate;
     v.addEventListener("loadedmetadata",metadata);v.addEventListener("error",fail);v.addEventListener("playing",playing);v.addEventListener("pause",paused);document.addEventListener("visibilitychange",visibility);
-    if(p.media.format==="hls"&&Hls.isSupported()){
+    if(p.media.format==="hls"&&hlsPlaybackPath(v)==="mse"){
       const engine=new Hls({enableWorker:true,workerPath,autoStartLoad:p.active&&!document.hidden,startPosition:Math.max(0,p.position),backBufferLength:30,interstitialsController:undefined,contentSteeringController:undefined,enableInterstitialPlayback:false});
       hls.current=engine;engine.loadSource(p.media.url);engine.attachMedia(v);
       engine.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)fail();});
